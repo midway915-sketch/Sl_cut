@@ -15,7 +15,13 @@ echo "[INFO] OUT_DIR=$OUT_DIR"
 # Required envs
 : "${PROFIT_TARGET:?}"
 : "${MAX_DAYS:?}"
-: "${STOP_LEVEL:?}"
+
+# ✅ 분리: Tail 라벨용 / Engine 손절용
+# - predict_gate.py는 호환/메타용으로 ENGINE_STOP_LEVEL을 넘겨도 되고,
+#   별도 관리가 필요하면 TAIL_STOP_LEVEL도 요구하도록 바꿔둠.
+: "${TAIL_STOP_LEVEL:?}"
+: "${ENGINE_STOP_LEVEL:?}"
+
 : "${P_TAIL_THRESHOLDS:?}"
 : "${UTILITY_QUANTILES:?}"
 : "${RANK_METRICS:?}"
@@ -74,6 +80,10 @@ TP1_HOLD_CAP_MODES="${TP1_HOLD_CAP_MODES:-none,h2,total}"
 echo "[INFO] CAP_COMPARE=$CAP_COMPARE"
 echo "[INFO] TP1_HOLD_CAP_SINGLE=$TP1_HOLD_CAP_SINGLE"
 echo "[INFO] TP1_HOLD_CAP_MODES=$TP1_HOLD_CAP_MODES"
+
+# ✅ stop-levels
+echo "[INFO] TAIL_STOP_LEVEL=$TAIL_STOP_LEVEL"
+echo "[INFO] ENGINE_STOP_LEVEL=$ENGINE_STOP_LEVEL"
 
 # ----- helpers
 split_csv() {
@@ -212,17 +222,24 @@ PY
 )"
               tu_s="tu1"  # ✅ 옵션B 제거 -> 항상 tu1
 
-              base_suffix="${mode}_${tu_s}_t${t_s}_q${uq_s}_r${rank_by}_lam${lam_s}_ps${ps_s}_k${K}_w$(echo "$W" | tr ',' '_')_tp${tp_pct}_tr${tr_s}"
+              # ✅ stop-levels도 suffix에 박아두면 결과 파일 구분이 쉬움
+              tsl_s="$(suffix_float "$TAIL_STOP_LEVEL")"
+              esl_s="$(suffix_float "$ENGINE_STOP_LEVEL")"
+
+              base_suffix="${mode}_${tu_s}_t${t_s}_q${uq_s}_r${rank_by}_lam${lam_s}_ps${ps_s}_k${K}_w$(echo "$W" | tr ',' '_')_tp${tp_pct}_tr${tr_s}_tsl${tsl_s}_esl${esl_s}"
 
               echo "=============================="
               echo "[RUN] mode=$mode tail_max=$tmax u_q=$uq rank_by=$rank_by lambda=$LAMBDA_TAIL ps_min=$psmin topk=$K weights=$W trail=$trail base_suffix=$base_suffix"
+              echo "[RUN] TAIL_STOP_LEVEL=$TAIL_STOP_LEVEL ENGINE_STOP_LEVEL=$ENGINE_STOP_LEVEL"
               echo "=============================="
 
               # ---- PREDICT
+              # ✅ predict는 엔진 stop을 넘겨도 되지만, 일단 "TAIL_STOP_LEVEL"을 메타로 싣고 싶으면 여기로 바꿔도 됨.
+              # 보수적으로: 엔진/실행환경과 일치하도록 ENGINE_STOP_LEVEL을 넘김(기존과 동일한 역할 유지)
               python "$PRED" \
                 --profit-target "$PROFIT_TARGET" \
                 --max-days "$MAX_DAYS" \
-                --stop-level "$STOP_LEVEL" \
+                --stop-level "$ENGINE_STOP_LEVEL" \
                 --max-extend-days "$MAX_EXTEND_DAYS" \
                 --mode "$mode" \
                 --tail-threshold "$tmax" \
@@ -286,7 +303,7 @@ PY
                   --picks-path "$picks_path" \
                   --profit-target "$PROFIT_TARGET" \
                   --max-days "$MAX_DAYS" \
-                  --stop-level "$STOP_LEVEL" \
+                  --stop-level "$ENGINE_STOP_LEVEL" \
                   --max-extend-days "$MAX_EXTEND_DAYS" \
                   --max-leverage-pct "$MAX_LEVERAGE_PCT" \
                   --enable-trailing "$ENABLE_TRAILING" \
@@ -308,7 +325,7 @@ PY
                   --suffix "$cap_suffix" \
                   --profit-target "$PROFIT_TARGET" \
                   --max-days "$MAX_DAYS" \
-                  --stop-level "$STOP_LEVEL" \
+                  --stop-level "$ENGINE_STOP_LEVEL" \
                   --max-extend-days "$MAX_EXTEND_DAYS" \
                   --out-dir "$OUT_DIR"
 
