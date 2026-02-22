@@ -175,7 +175,7 @@ jobs:
             python scripts/build_labels.py \
               --profit-target "${PROFIT_TARGET}" \
               --max-days "${MAX_DAYS}" \
-              --stop-level "${ENGINE_STOP_LEVEL}"
+              --stop-level "${TAIL_STOP_LEVEL}"
           else
             echo "[INFO] labels_model exists -> reuse"
           fi
