@@ -218,13 +218,10 @@ def main() -> None:
             "Fixes:\n"
             " - CycleReturn always numeric (uses cycle_buy_total / cycle_sell_total)\n"
             " - Invested/Proceeds no longer become 0 just because legs were zeroed\n"
-            " - NEW: reset buy/sell totals at cycle start (hard reset to prevent residue)\n"
-            "NEW (period cap after TP1; stop-loss still NOT applied in engine):\n"
+            " - reset buy/sell totals at cycle start (hard reset to prevent residue)\n"
+            "NEW:\n"
+            " - STOP_LEVEL stop-loss is now APPLIED pre-TP1 only, triggered by intraday Low.\n"
             " - --tp1-hold-cap none|h2|total\n"
-            "   none : no extra cap after TP1 (legacy behavior)\n"
-            "   h2   : after first TP1, allow only +H//2 holding days then force close\n"
-            "   total: after first TP1, force close when holding_days >= H + H//2\n"
-            "NEW (tau mapping stabilization for fair comparison):\n"
             " - --tau-h-map 30,40,50 (used when tau_H missing; or when only tau_class exists)\n"
         )
     )
@@ -240,7 +237,7 @@ def main() -> None:
 
     ap.add_argument("--profit-target", required=True, type=float)
     ap.add_argument("--max-days", required=True, type=int)
-    ap.add_argument("--stop-level", required=True, type=float)  # kept for metadata compatibility
+    ap.add_argument("--stop-level", required=True, type=float)  # ✅ now actually used (pre-TP1 only)
     ap.add_argument("--max-extend-days", required=True, type=int)
 
     ap.add_argument("--max-leverage-pct", default=1.0, type=float)
@@ -255,10 +252,10 @@ def main() -> None:
     ap.add_argument("--topk", default=1, type=int)
     ap.add_argument("--weights", default="1.0", type=str)
 
-    # ✅ NEW: period cap policy after TP1
+    # period cap policy after TP1
     ap.add_argument("--tp1-hold-cap", default="none", type=str, choices=["none", "h2", "total"])
 
-    # ✅ NEW: tau class -> H mapping (fallback / stabilization)
+    # tau class -> H mapping (fallback / stabilization)
     ap.add_argument("--tau-h-map", default="30,40,50", type=str)
 
     # re-eval thresholds
@@ -335,6 +332,10 @@ def main() -> None:
     trades = []
     curve = []
 
+    # stop-loss config (pre-TP1 only)
+    stop_level = float(args.stop_level)
+    use_stop_loss = np.isfinite(stop_level) and (stop_level < 0.0)
+
     def liquidate_all_legs(day_prices_close: dict[str, float]) -> float:
         """Sell ALL remaining shares at close. Returns proceeds for the liquidation part only."""
         proceeds = 0.0
@@ -357,14 +358,13 @@ def main() -> None:
         invested_total = float(st.cycle_buy_total)
         proceeds_total = float(st.cycle_sell_total)
 
-        # ✅ always numeric
+        # always numeric
         if invested_total > 0:
             cycle_return = (proceeds_total - invested_total) / invested_total
         else:
             cycle_return = 0.0
 
         win = int(cycle_return > 0)
-
         cmr = float(st.cycle_max_return) if np.isfinite(st.cycle_max_return) else np.nan
 
         # cap days info (for audit)
@@ -393,6 +393,7 @@ def main() -> None:
             "TP1FirstHoldingDay": int(st.tp1_first_holding_day),
 
             "TauHMap": ",".join([str(x) for x in hmap]),
+            "StopLossEnabled": int(use_stop_loss),
 
             "GraceDays": int(st.grace_days_total),
             "RevalStrength": st.reval_strength,
@@ -436,14 +437,14 @@ def main() -> None:
         st.max_leverage_pct = 0.0
         st.legs = []
 
-        # ✅ reset A-version flags
+        # reset A-version flags
         st.dca_locked = False
         st.trailing_started = False
         st.trailing_entries = 0
         st.tp1_first_holding_day = 0
         st.cycle_max_return = np.nan
 
-        # ✅ reset realized totals for next cycle
+        # reset realized totals for next cycle
         st.cycle_buy_total = 0.0
         st.cycle_sell_total = 0.0
 
@@ -478,12 +479,6 @@ def main() -> None:
         return "FAIL", ps_m, pt_m
 
     def should_force_close_after_tp1() -> tuple[bool, str]:
-        """
-        Apply cap only AFTER at least one TP1 in the cycle.
-        - none : never force close due to cap
-        - h2   : if holding_days >= (tp1_first_holding_day + H//2)
-        - total: if holding_days >= (H + H//2)
-        """
         if not st.in_cycle:
             return False, ""
         if tp1_hold_cap == "none":
@@ -552,16 +547,47 @@ def main() -> None:
 
             # if closed by reval, skip rest
             if st.in_cycle:
-                # 1) TP1 + trailing per leg
+                # 1) STOP-LOSS (pre-TP1 only), triggered by intraday LOW.
+                #    NOTE: If a day could both hit TP1(high) and stop-loss(low), we apply stop-loss first (conservative).
+                if use_stop_loss:
+                    for leg in st.legs:
+                        if leg.ticker not in day_df.index:
+                            continue
+                        if leg.shares <= 0:
+                            continue
+                        if leg.tp1_done:
+                            continue  # TP1 이후는 trailing만
+                        avg = leg.avg_price()
+                        low_px = day_prices_low[leg.ticker]
+                        if not (np.isfinite(avg) and avg > 0 and np.isfinite(low_px) and low_px > 0):
+                            continue
+
+                        stop_px = avg * (1.0 + float(stop_level))  # stop_level is negative
+                        if np.isfinite(stop_px) and stop_px > 0 and low_px <= stop_px:
+                            proceeds = leg.shares * stop_px
+                            st.seed += proceeds
+                            st.cycle_sell_total += float(proceeds)
+                            leg.shares = 0.0
+                            leg.invested = 0.0
+
+                    # if all legs emptied by stop-loss -> close
+                    if st.in_cycle and all((leg.shares <= 0 for leg in st.legs)):
+                        close_cycle(date, day_prices_close, reason="STOP_LOSS_EXIT_ALL")
+
+            # continue only if still in cycle
+            if st.in_cycle:
+                # 2) TP1 + trailing per leg
                 if enable_trailing:
                     for leg in st.legs:
                         if leg.ticker not in day_df.index:
+                            continue
+                        if leg.shares <= 0:
                             continue
                         high_px = day_prices_high[leg.ticker]
                         low_px = day_prices_low[leg.ticker]
                         avg = leg.avg_price()
 
-                        # TP1 event
+                        # TP1 event (only if NOT already TP1 and still alive)
                         if (not leg.tp1_done) and np.isfinite(avg) and high_px >= avg * (1.0 + float(args.profit_target)):
                             tp_px = avg * (1.0 + float(args.profit_target))
                             sell_shares = leg.shares * float(args.tp1_frac)
@@ -585,7 +611,6 @@ def main() -> None:
                             if not st.trailing_started:
                                 st.trailing_started = True
                                 st.trailing_entries = 1
-                                # ✅ record TP1 first day index for cap policy
                                 st.tp1_first_holding_day = int(st.holding_days)
 
                             st.dca_locked = True
@@ -603,24 +628,24 @@ def main() -> None:
                                 leg.shares = 0.0
                                 leg.invested = 0.0
 
-                # 2) if all legs emptied -> close
+                # 3) if all legs emptied -> close
                 if st.in_cycle and all((leg.shares <= 0 for leg in st.legs)):
                     close_cycle(date, day_prices_close, reason="TRAIL_EXIT_ALL")
 
-            # ✅ 2.5) TP1-period cap (only after at least one TP1)
+            # 3.5) TP1-period cap (only after at least one TP1)
             if st.in_cycle:
                 force, why = should_force_close_after_tp1()
                 if force:
                     close_cycle(date, day_prices_close, reason=why)
 
-            # 3) H reached: set pending_reval only if no TP1 anywhere
+            # 4) H reached: set pending_reval only if no TP1 anywhere
             if st.in_cycle and (not st.extending) and (not st.pending_reval):
                 any_tp1 = any((leg.tp1_done for leg in st.legs))
                 if (not any_tp1) and (st.H > 0) and (st.holding_days >= st.H):
                     st.ret_H = compute_cycle_return_today(st, day_prices_close)
                     st.pending_reval = True
 
-            # 4) Grace mode: DCA STOP anyway; apply recovery-stop only if NO TP1 anywhere
+            # 5) Grace mode: DCA STOP anyway; apply recovery-stop only if NO TP1 anywhere
             if st.in_cycle and st.extending:
                 any_tp1 = any((leg.tp1_done for leg in st.legs))
                 if not any_tp1:
@@ -651,7 +676,7 @@ def main() -> None:
                     st.update_dd(day_prices_close)
                     st.update_cycle_max_return(day_prices_close)
 
-            # 5) Normal mode DCA
+            # 6) Normal mode DCA
             if st.in_cycle and (not st.extending) and (not st.pending_reval):
                 if not st.dca_locked:
                     desired_total = float(st.unit)
@@ -694,7 +719,7 @@ def main() -> None:
                 if len(valid) >= 1:
                     chosen = valid[:topk]
 
-                    # ✅ decide H from features_scored:
+                    # decide H from features_scored:
                     #   1) tau_H (preferred)
                     #   2) tau_class -> tau-h-map
                     #   3) fallback to middle of hmap (default 40)
@@ -719,7 +744,7 @@ def main() -> None:
                     H_eff = int(max(Hs)) if Hs else int(fallback_H)
                     H_eff = int(max(1, H_eff))
 
-                    # ✅ HARD RESET totals right before starting a new cycle
+                    # HARD RESET totals right before starting a new cycle
                     st.cycle_buy_total = 0.0
                     st.cycle_sell_total = 0.0
 
@@ -789,6 +814,8 @@ def main() -> None:
             "RecoveryThreshold": float(st.recovery_threshold) if np.isfinite(st.recovery_threshold) else np.nan,
             "MaxLeveragePctCycle": st.max_leverage_pct if st.in_cycle else 0.0,
             "MaxDrawdownPortfolio": st.max_dd,
+
+            "StopLossEnabled": int(use_stop_loss) if st.in_cycle else 0,
 
             "DcaLocked": int(st.dca_locked) if st.in_cycle else 0,
             "TrailingEntriesCycle": int(st.trailing_entries) if st.in_cycle else 0,
