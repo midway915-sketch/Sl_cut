@@ -48,12 +48,12 @@ on:
       rebuild_all:
         description: "true to rebuild prices/features/labels/models from scratch"
         required: true
-        default: "false"
+        default: "true"
 
       dedup_picks:
         description: "true=dedupe picks (skip duplicate hashes), false=run all"
         required: true
-        default: "true"
+        default: "false"
 
   schedule:
     - cron: "10 23 * * *"
@@ -84,7 +84,7 @@ jobs:
       GATE_MODES: "none,tail,utility,tail_utility"
 
       ENABLE_TRAILING: "true"
-      TP1_FRAC: "0.50"
+      TP1_FRAC: "1.00"
       TRAIL_STOPS: "0.08,0.10,0.12"
 
       TOPK_CONFIGS: "1|1.0"
